@@ -1,0 +1,42 @@
+
+services:
+  api1:
+    build: ./backend
+    environment:
+      SERVER_ID: server-1
+    restart: unless-stopped
+
+  api2:
+    build: ./backend
+    environment:
+      SERVER_ID: server-2
+    restart: unless-stopped
+
+  api3:
+    build: ./backend
+    environment:
+      SERVER_ID: server-3
+    restart: unless-stopped
+
+  haproxy:
+    image: haproxy:3.2
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      - api1
+      - api2
+      - api3
+    restart: unless-stopped
+
+  intelligent-router:
+    build: ./backend
+    command: uvicorn router:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8081:8000"
+    depends_on:
+      - api1
+      - api2
+      - api3
+    restart: unless-stopped

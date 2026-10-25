@@ -2,7 +2,7 @@
 import asyncio
 import os
 import time
-
+from copy import deepcopy
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import Response
@@ -17,7 +17,13 @@ BACKENDS = {
 
 client = None
 last_decision = None
+metrics_requests_total = 0
+metrics_requests_success = 0
+metrics_requests_failed = 0
+METRICS_CACHE_TTL = 0.25
 
+metrics_cache = {}
+metrics_cache_lock = asyncio.Lock()
 # Requests assigned by this router that have not finished yet.
 in_flight = {name: 0 for name in BACKENDS}
 
@@ -37,23 +43,56 @@ async def shutdown():
         await client.aclose()
 
 
+
 async def get_backend_metrics(name, url):
+    global metrics_requests_total
+    global metrics_requests_success
+    global metrics_requests_failed
+
+    now = time.monotonic()
+
+    async with metrics_cache_lock:
+        cached = metrics_cache.get(name)
+
+        if cached and now - cached["timestamp"] < METRICS_CACHE_TTL:
+            return deepcopy(cached["data"])
+
+    metrics_requests_total += 1
+
     try:
         response = await client.get(f"{url}/metrics")
         response.raise_for_status()
         metrics = response.json()
 
+        metrics_requests_success += 1
+
         if not metrics.get("healthy", False):
+            async with metrics_cache_lock:
+                metrics_cache.pop(name, None)
             return None
 
-        return {
+        result = {
             "name": name,
             "url": url,
             "metrics": metrics,
         }
 
+        async with metrics_cache_lock:
+            metrics_cache[name] = {
+                "timestamp": time.monotonic(),
+                "data": deepcopy(result),
+            }
+
+        return result
+
     except (httpx.HTTPError, ValueError, TypeError):
+        metrics_requests_failed += 1
+
+        async with metrics_cache_lock:
+            metrics_cache.pop(name, None)
+
         return None
+
 
 
 async def choose_backend(reserve=False):
@@ -139,7 +178,13 @@ async def routing_decision():
             for item in healthy
         ],
     }
-
+@app.get("/router/debug/metrics-counts")
+async def metrics_count_debug():
+    return {
+        "metrics_requests_total": metrics_requests_total,
+        "metrics_requests_success": metrics_requests_success,
+        "metrics_requests_failed": metrics_requests_failed,
+    }
 
 @app.api_route(
     "/{path:path}",
@@ -147,7 +192,6 @@ async def routing_decision():
 )
 async def route_request(request: Request, path: str):
     global last_decision
-
     selected, _ = await choose_backend(reserve=True)
     name = selected["name"]
 

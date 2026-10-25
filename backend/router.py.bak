@@ -1,0 +1,223 @@
+
+import asyncio
+import os
+import time
+
+import httpx
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import Response
+
+app = FastAPI(title="Intelligent Load Balancer Router")
+
+BACKENDS = {
+    "api1": os.getenv("API1_URL", "http://api1:8000"),
+    "api2": os.getenv("API2_URL", "http://api2:8000"),
+    "api3": os.getenv("API3_URL", "http://api3:8000"),
+}
+
+client = None
+last_decision = None
+metrics_requests_total = 0
+metrics_requests_success = 0
+metrics_requests_failed = 0
+# Requests assigned by this router that have not finished yet.
+in_flight = {name: 0 for name in BACKENDS}
+
+# Makes selection and reservation one atomic operation.
+selection_lock = asyncio.Lock()
+
+
+@app.on_event("startup")
+async def startup():
+    global client
+    client = httpx.AsyncClient(timeout=30.0)
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    if client:
+        await client.aclose()
+
+
+async def get_backend_metrics(name, url):
+    global metrics_requests_total
+    global metrics_requests_success
+    global metrics_requests_failed
+
+    metrics_requests_total += 1
+
+    try:
+        response = await client.get(f"{url}/metrics")
+        response.raise_for_status()
+        metrics = response.json()
+
+        metrics_requests_success += 1
+
+        if not metrics.get("healthy", False):
+            return None
+
+        return {
+            "name": name,
+            "url": url,
+            "metrics": metrics,
+        }
+
+    except (httpx.HTTPError, ValueError, TypeError):
+        metrics_requests_failed += 1
+        return None
+
+
+
+async def choose_backend(reserve=False):
+    results = await asyncio.gather(
+        *[
+            get_backend_metrics(name, url)
+            for name, url in BACKENDS.items()
+        ]
+    )
+
+    healthy = [item for item in results if item is not None]
+
+    if not healthy:
+        raise HTTPException(
+            status_code=503,
+            detail="No healthy backend servers available",
+        )
+
+    async with selection_lock:
+        for item in healthy:
+            metrics = item["metrics"]
+
+            # /metrics itself counts as an active request.
+            # Subtract that probe from the reported count.
+            reported_active = max(
+                0, metrics.get("active_requests", 0) - 1
+            )
+
+            # Use whichever count better reflects current in-flight load.
+            effective_active = max(
+                reported_active,
+                in_flight[item["name"]],
+            )
+
+            cpu = max(
+                0, min(100, metrics.get("cpu_percent", 100))
+            )
+            response_time = max(
+                0, metrics.get("avg_response_time_ms", 1000)
+            )
+
+            item["effective_active"] = effective_active
+            item["router_in_flight"] = in_flight[item["name"]]
+            item["score"] = round(
+                10 * effective_active
+                + 0.2 * cpu
+                + 0.02 * min(response_time, 1000),
+                3,
+            )
+
+        healthy.sort(
+            key=lambda item: (item["score"], item["name"])
+        )
+        selected = healthy[0]
+
+        # Reserve BEFORE releasing the lock, so another request
+        # sees this assignment when making its own decision.
+        if reserve:
+            in_flight[selected["name"]] += 1
+
+    return selected, healthy
+
+
+@app.get("/router/decision")
+async def routing_decision():
+    selected, healthy = await choose_backend()
+
+    return {
+        "algorithm": "least-load-with-reservations",
+        "selected_backend": selected["name"],
+        "selected_score": selected["score"],
+        "candidates": [
+            {
+                "server": item["name"],
+                "score": item["score"],
+                "active_requests": item["metrics"]["active_requests"],
+                "router_in_flight": item["router_in_flight"],
+                "cpu_percent": item["metrics"]["cpu_percent"],
+                "avg_response_time_ms": item["metrics"][
+                    "avg_response_time_ms"
+                ],
+            }
+            for item in healthy
+        ],
+    }
+@app.get("/router/debug/metrics-counts")
+async def metrics_count_debug():
+    return {
+        "metrics_requests_total": metrics_requests_total,
+        "metrics_requests_success": metrics_requests_success,
+        "metrics_requests_failed": metrics_requests_failed,
+    }
+
+@app.api_route(
+    "/{path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+)
+async def route_request(request: Request, path: str):
+    global last_decision
+    selected, _ = await choose_backend(reserve=True)
+    name = selected["name"]
+
+    last_decision = {
+        "selected_backend": name,
+        "selected_score": selected["score"],
+        "time": time.time(),
+    }
+
+    try:
+        target = f"{selected['url']}/{path}"
+        if request.url.query:
+            target += f"?{request.url.query}"
+
+        excluded_headers = {
+            "host", "connection", "content-length", "transfer-encoding"
+        }
+        headers = {
+            key: value
+            for key, value in request.headers.items()
+            if key.lower() not in excluded_headers
+        }
+
+        upstream = await client.request(
+            method=request.method,
+            url=target,
+            headers=headers,
+            content=await request.body(),
+        )
+
+        response_headers = {
+            key: value
+            for key, value in upstream.headers.items()
+            if key.lower() not in {
+                "connection", "transfer-encoding",
+                "content-length", "content-encoding",
+            }
+        }
+        response_headers["X-Selected-Backend"] = name
+
+        return Response(
+            content=upstream.content,
+            status_code=upstream.status_code,
+            headers=response_headers,
+        )
+
+    except httpx.HTTPError:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Selected backend {name} could not be reached",
+        )
+
+    finally:
+        # Release the reservation on success, failure, or cancellation.
+        async with selection_lock:
+            in_flight[name] = max(0, in_flight[name] - 1)
